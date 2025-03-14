@@ -77,5 +77,5 @@ class DeepSearchPipeline:
 deepSearch = DeepSearchPipeline("Python")
 
 
-query_results = deepSearch.query_vector_db("When python was released?")
+query_results = deepSearch.query_vector_db("When python was ")
 print(deepSearch.links)
