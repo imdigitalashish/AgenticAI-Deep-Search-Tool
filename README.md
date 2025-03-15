@@ -1,0 +1,7 @@
+- [ ] Searching the user query
+- [ ] Gathering the site data
+- [ ] Putting the site data in knowledge base
+- [ ] Creating the knowledge base
+- [ ] Cleaning the KB
+- [ ] Chunking the KB
+- [ ] Generating the Report
