@@ -1,231 +1,196 @@
 import os
 import json
-import gc
 import asyncio
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
+from groq import Groq
+import re
+import logging
+from sentence_transformers import SentenceTransformer
+import numpy as np
+
+# Initialize Groq client
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+# Initialize sentence transformer model for embeddings
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Configure logging
 
 class KnowledgeProcessor:
-    def __init__(self, main_query, knowledge_bases):
+    def __init__(self, main_query, knowledge_bases, cache_file="topic_summaries.json"):
         self.main_query = main_query
         self.knowledge_bases = knowledge_bases
         self.topic_summaries = {}
-        self.model, self.tokenizer = self.load_gemma_model()
-        
-    def load_gemma_model(self):
-        """Load the Gemma model with memory optimization for MPS"""
-        model_name = "google/gemma-2-2b-it"
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="mps" if torch.backends.mps.is_available() else "cpu",
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True,
-            max_memory={0: "4GB"}  # Adjusted for safety
-        )
-        model.eval()  # Set to evaluation mode to reduce memory usage
-        return model, tokenizer
-    
+        self.cache_file = cache_file
+        print(f"Initialized KnowledgeProcessor with main query: {main_query}")
+
     async def process_all_knowledge_bases(self):
-        """Process all knowledge bases with a semaphore to limit concurrency"""
-        semaphore = asyncio.Semaphore(1)  # Limit to 1 task at a time
-        async def sem_task(sub_query, kb_info):
-            async with semaphore:
-                return await self.process_single_knowledge_base(sub_query, kb_info)
+        """Process all knowledge bases in parallel."""
+        # Check if cached results exist and are valid
+        if os.path.exists(self.cache_file):
+            with open(self.cache_file, 'r') as f:
+                cached_summaries = json.load(f)
+            if self._is_cache_valid(cached_summaries):
+                print("Using cached results.")
+                self.topic_summaries = cached_summaries
+                return self.topic_summaries
+
+        print("Starting parallel processing of all knowledge bases.")
+        tasks = [self.process_single_knowledge_base(sub_query, kb_info) 
+                 for sub_query, kb_info in self.knowledge_bases.items()]
+        results = await asyncio.gather(*tasks)
+        self.topic_summaries = {sub_query: result for sub_query, result in zip(self.knowledge_bases.keys(), results)}
         
-        tasks = [sem_task(sub_query, kb_info) for sub_query, kb_info in self.knowledge_bases.items()]
-        await asyncio.gather(*tasks)
+        # Cache results
+        with open(self.cache_file, 'w') as f:
+            json.dump(self.topic_summaries, f, indent=4)
+        print("Finished processing and cached results.")
         return self.topic_summaries
-        
+
+    def _is_cache_valid(self, cached_summaries):
+        """Check if cached results are still valid based on file modification times."""
+        if cached_summaries.keys() != self.knowledge_bases.keys():
+            return False
+        for sub_query, kb_info in self.knowledge_bases.items():
+            kb_path = kb_info["kb_path"]
+            if os.path.getmtime(kb_path) > os.path.getctime(self.cache_file):
+                return False
+        return True
+
     async def process_single_knowledge_base(self, sub_query, kb_info):
-        """Process a single knowledge base and generate topic summaries"""
+        """Process a single knowledge base and generate topic summaries."""
         kb_path = kb_info["kb_path"]
         purpose = kb_info["purpose"]
-        query_id = kb_info["query_id"]
-        
-        topics = await self.generate_topics(kb_path, sub_query)
-        del kb_path  # Free up memory
-        
-        topic_insights = {}
-        for topic in topics:
-            insight = await self.extract_topic_information(kb_path, topic, sub_query)
-            topic_insights[topic] = insight
-            del insight  # Free up memory after use
-            gc.collect()  # Force garbage collection
-            torch.mps.empty_cache() if torch.backends.mps.is_available() else None
-            
-        self.topic_summaries[sub_query] = {
-            "purpose": purpose,
-            "topics": topic_insights
-        }
-        del topics, topic_insights  # Clean up
-        gc.collect()
-        torch.mps.empty_cache() if torch.backends.mps.is_available() else None
-        
-        return self.topic_summaries[sub_query]
-        
-    async def generate_topics(self, kb_path, sub_query):
-        """Generate key topics from the knowledge base"""
-        with open(kb_path, 'r') as f:
-            kb_content = f.read()
-            
-        if len(kb_content) > 20000:  # Reduced from 50000
-            kb_content = kb_content[:20000]
-        
-        system_prompt = f"""
-        Analyze the provided knowledge base about "{sub_query}" and identify 3-5 key topics or themes that should be explored.
-        Return the result as a JSON array of topic strings.
-        Example: ["Historical Context", "Key Figures", "Social Impact", "Technological Aspects"]
-        """
-        
-        input_text = system_prompt + "\n\n" + kb_content
-        inputs = self.tokenizer(input_text, return_tensors="pt").to(self.model.device)
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=100,  # Reduced from 200
-                temperature=0.7,
-                do_sample=True
-            )
-        
-        result = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        del inputs, outputs  # Free memory
-        gc.collect()
-        torch.mps.empty_cache() if torch.backends.mps.is_available() else None
-        
-        try:
-            json_start = result.find('[')
-            json_end = result.rfind(']') + 1
-            json_str = result[json_start:json_end]
-            topics = json.loads(json_str)
-            return topics
-        except (json.JSONDecodeError, ValueError):
-            print(f"[SERVER]: Error parsing topics JSON for {sub_query}, using default topics")
-            return ["General Information", "Key Points", "Analysis"]
-    
-    async def extract_topic_information(self, kb_path, topic, sub_query):
-        """Extract insights for a specific topic from the knowledge base"""
-        with open(kb_path, 'r') as f:
-            kb_content = f.read()
-            
-        chunks = self.chunk_text(kb_content, chunk_size=1000, overlap=50)  # Reduced from 2000
-        
-        scored_chunks = []
-        for chunk in chunks:
-            relevance_score = self.calculate_relevance(chunk, topic)
-            scored_chunks.append((chunk, relevance_score))
-            
-        scored_chunks.sort(key=lambda x: x[1], reverse=True)
-        top_chunks = [chunk for chunk, score in scored_chunks[:2]]  # Reduced to 2 chunks
-        del chunks, scored_chunks  # Free memory
-        
-        rag_content = f"Topic: {topic}\nQuery: {sub_query}\n\n" + "\n\n".join(top_chunks)
-        
-        system_prompt = f"""
-        Extract and synthesize information specifically about the topic "{topic}" related to "{sub_query}" from the provided knowledge base excerpts.
-        Focus only on this specific topic, providing a comprehensive but concise summary in markdown format.
-        """
-        
-        input_text = system_prompt + "\n\n" + rag_content
-        inputs = self.tokenizer(input_text, return_tensors="pt").to(self.model.device)
-        
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=150,  # Reduced from 300
-                temperature=0.7,
-                do_sample=True
-            )
-        
-        result = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        del inputs, outputs, input_text, rag_content  # Free memory
-        gc.collect()
-        torch.mps.empty_cache() if torch.backends.mps.is_available() else None
-        
-        try:
-            json_start = result.find('{')
-            json_end = result.rfind('}') + 1
-            json_str = result[json_start:json_end]
-            return json.loads(json_str)['markdown']
-        except (json.JSONDecodeError, KeyError):
-            return "Error processing this topic."
-    
-    def chunk_text(self, text, chunk_size=1000, overlap=50):
-        """Split text into smaller chunks"""
-        if len(text) <= chunk_size:
-            return [text]
-            
-        chunks = []
-        start = 0
-        while start < len(text):
-            end = start + chunk_size
-            if end >= len(text):
-                chunks.append(text[start:])
-            else:
-                paragraph_break = text.rfind("\n\n", start, end)
-                sentence_break = text.rfind(". ", start, end)
-                
-                if paragraph_break > start + chunk_size // 2:
-                    end = paragraph_break + 2
-                elif sentence_break > start + chunk_size // 2:
-                    end = sentence_break + 2
-                    
-                chunks.append(text[start:end])
-                start = end - overlap  
-                
-        return chunks
-    
-    def calculate_relevance(self, text, topic):
-        """Calculate relevance score of text to a topic"""
-        topic_terms = topic.lower().split()
-        text_lower = text.lower()
-        
-        score = 0
-        for term in topic_terms:
-            score += text_lower.count(term)
-            
-        return score / (len(text) / 1000)
 
-# Knowledge bases dictionary (unchanged)
+        print(f"Processing knowledge base: {sub_query} (path: {kb_path})")
+        
+        # Read and clean the full text
+        full_text = "".join(self.read_and_clean_file_in_chunks(kb_path))
+        
+        # Generate topics from the full text
+        topics = await self.generate_topics(full_text, sub_query)
+        print(f"Generated topics for {sub_query}: {topics}")
+
+        # Extract insights for each topic
+        topic_insights = {}
+        chunks = list(self.read_and_clean_file_in_chunks(kb_path, chunk_size=5000))  # Smaller chunks for embeddings
+        for topic in topics.get("response", []):
+            insight = await self.extract_topic_information(chunks, topic, sub_query)
+            topic_insights[topic] = insight
+            print(f"Extracted insight for topic '{topic}' in {sub_query}.")
+
+        result = {"purpose": purpose, "topics": topic_insights}
+        return result
+
+    async def generate_topics(self, text, sub_query):
+        """Generate key topics from the full text."""
+        system_prompt = f"""
+        Analyze the provided knowledge base about "{sub_query}" and identify 3-5 key topics or themes.
+        Return the result as a JSON object with a single key "response" containing an array of topic strings.
+        Example: {{"response": ["Historical Context", "Key Figures", "Social Impact"]}}
+        """
+        try:
+            chat_completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text[:20000]}],  # Truncate to avoid token limits
+                model="llama-3.1-8b-instant",
+                max_tokens=200,
+                temperature=0.7,
+                stream=False,
+            )
+            result = json.loads(chat_completion.choices[0].message.content.strip())
+            return result
+        except Exception as e:
+            logging.error(f"Error generating topics for {sub_query}: {e}")
+            return {"response": ["General Information", "Key Points", "Analysis"]}
+
+    async def extract_topic_information(self, chunks, topic, sub_query):
+        """Extract insights for a topic using vector embeddings for efficiency."""
+        system_prompt = f"""
+        Extract and synthesize information specifically about the topic "{topic}" related to "{sub_query}".
+        Provide a concise summary based on the provided text.
+        """
+        # Generate embeddings for chunks and topic
+        chunk_embeddings = embedding_model.encode(chunks)
+        topic_embedding = embedding_model.encode([topic])[0]
+        
+        # Find top 3 most relevant chunks
+        similarities = np.dot(chunk_embeddings, topic_embedding) / (np.linalg.norm(chunk_embeddings, axis=1) * np.linalg.norm(topic_embedding))
+        top_k_indices = similarities.argsort()[-3:][::-1]
+        relevant_chunks = [chunks[i] for i in top_k_indices]
+        
+        # Summarize relevant chunks
+        summary = ""
+        for chunk in relevant_chunks:
+            try:
+                chat_completion = client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": chunk},
+                    ],
+                    model="llama-3.1-8b-instant",
+                    max_tokens=150,
+                    temperature=0.7,
+                    stream=False,
+                )
+                summary += " " + chat_completion.choices[0].message.content.strip()
+            except Exception as e:
+                logging.error(f"Error summarizing chunk for topic '{topic}': {e}")
+        return summary.strip() or "No relevant information found."
+
+    def read_and_clean_file_in_chunks(self, file_path, chunk_size=5000):
+        """Read and clean a file in chunks."""
+        with open(file_path, 'r', encoding='utf-8') as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                cleaned_chunk = self.clean_text(chunk)
+                if cleaned_chunk.strip():
+                    yield cleaned_chunk
+
+    def clean_text(self, text):
+        """Remove unwanted patterns from text."""
+        text = re.sub(r'\s*\*\s*\[[^\]]+\]\([^)]+\)', '', text)  # Remove markdown links
+        text = re.sub(r'###\s*\[[^\]]+\]\([^)]+\)', '', text)    # Remove headers with links
+        return text.strip()
+
+# Example knowledge bases (replace with your actual paths)
 knowledge_bases = {
-    "What are the most popular and reputable cryptocurrency platforms and exchanges for trading, staking, and lending?": {
-        "purpose": "To identify reliable and trustworthy services for engaging in cryptocurrency-related income generation.",
-        "kb_path": "/Users/imdigitalashish/Projects/Ashish/AgenticProjects/research_df22a5e7-a1e8-43e2-8b5d-a539a2d86c4e/knowledge_cf5f5192.md",
-        "query_id": "cf5f5192"
+    "What are the key metrics used to measure the financial performance and growth of a SaaS company?": {
+        "purpose": "To identify crucial indicators for assessing the financial health and potential of a SaaS business (e.g., MRR, ARR, Churn, CAC, LTV).",
+        "kb_path": "/Users/imdigitalashish/Projects/Ashish/AgenticProjects/research_5d404a6c-11fb-40eb-876e-32b2de9a5c06/knowledge_4c42ba08.md",
+        "query_id": "4c42ba08"
     },
-    "What are the risks and potential downsides associated with each method of making money with cryptocurrency?": {
-        "purpose": "To assess the potential losses and challenges involved in each approach, enabling informed decision-making.",
-        "kb_path": "/Users/imdigitalashish/Projects/Ashish/AgenticProjects/research_df22a5e7-a1e8-43e2-8b5d-a539a2d86c4e/knowledge_61cc84b5.md",
-        "query_id": "61cc84b5"
+    "What are the most common marketing and sales strategies employed by profitable SaaS companies to acquire and retain customers?": {
+        "purpose": "To understand customer acquisition and retention techniques for revenue generation.",
+        "kb_path": "/Users/imdigitalashish/Projects/Ashish/AgenticProjects/research_5d404a6c-11fb-40eb-876e-32b2de9a5c06/knowledge_5dc686fa.md",
+        "query_id": "5dc686fa"
     },
-    "What are the different methods of earning income with cryptocurrencies (e.g., trading, staking, mining, lending)?": {
-        "purpose": "To understand the range of available income-generating strategies in the cryptocurrency space.",
-        "kb_path": "/Users/imdigitalashish/Projects/Ashish/AgenticProjects/research_df22a5e7-a1e8-43e2-8b5d-a539a2d86c4e/knowledge_ff2c50b0.md",
-        "query_id": "ff2c50b0"
+    "What are the different pricing models commonly used in successful SaaS businesses?": {
+        "purpose": "To understand various revenue generation strategies in SaaS.",
+        "kb_path": "/Users/imdigitalashish/Projects/Ashish/AgenticProjects/research_5d404a6c-11fb-40eb-876e-32b2de9a5c06/knowledge_2dee47c1.md",
+        "query_id": "2dee47c1"
     },
-    "What tax regulations and legal considerations apply to cryptocurrency income in different jurisdictions?": {
-        "purpose": "To understand the legal and financial obligations associated with earning money from cryptocurrencies.",
-        "kb_path": "/Users/imdigitalashish/Projects/Ashish/AgenticProjects/research_df22a5e7-a1e8-43e2-8b5d-a539a2d86c4e/knowledge_370b8d57.md",
-        "query_id": "370b8d57"
+    "What are the legal and regulatory considerations for operating a SaaS business and monetizing it?": {
+        "purpose": "To ensure legal compliance and avoid potential issues related to data privacy, intellectual property, and payments.",
+        "kb_path": "/Users/imdigitalashish/Projects/Ashish/AgenticProjects/research_5d404a6c-11fb-40eb-876e-32b2de9a5c06/knowledge_707e9ff9.md",
+        "query_id": "707e9ff9"
     },
-    "What are some successful case studies or examples of individuals or entities making substantial income with cryptocurrency?": {
-        "purpose": "To gain insights from real-world examples and learn from successful strategies, while also understanding the potential for survivorship bias.",
-        "kb_path": "/Users/imdigitalashish/Projects/Ashish/AgenticProjects/research_df22a5e7-a1e8-43e2-8b5d-a539a2d86c4e/knowledge_e1908553.md",
-        "query_id": "e1908553"
+    "What are some successful case studies of SaaS businesses, and what were their key strategies for earning money?": {
+        "purpose": "To learn from real-world examples and identify effective monetization approaches.",
+        "kb_path": "/Users/imdigitalashish/Projects/Ashish/AgenticProjects/research_5d404a6c-11fb-40eb-876e-32b2de9a5c06/knowledge_8cedfb70.md",
+        "query_id": "8cedfb70"
     }
 }
 
 async def test_knowledge_base_and_report():
-    """Test the knowledge processor and save results"""
-    main_query = "Making money with Crypto"
+    """Test the knowledge processor and save results."""
+    main_query = "Making money with SaaS"
     processor = KnowledgeProcessor(main_query, knowledge_bases)
     topic_summaries = await processor.process_all_knowledge_bases()
     print(f"Generated topic summaries for {len(topic_summaries)} sub-queries")
-    
-    with open("topic_summaries.json", "w") as f:
-        json.dump(topic_summaries, f, indent=4)
+    print(json.dumps(topic_summaries, indent=4))
 
 if __name__ == "__main__":
     asyncio.run(test_knowledge_base_and_report())
