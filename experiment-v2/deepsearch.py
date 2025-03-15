@@ -7,8 +7,14 @@ import asyncio
 from dotenv import load_dotenv 
 from crawl4ai import AsyncWebCrawler
 from google import genai
+import json
+from pydantic import BaseModel
 
 load_dotenv()
+
+
+class MarkdownResponse(BaseModel):
+    markdown: str
 
 class DeepSearchTool():
     def __init__(self, query):
@@ -136,18 +142,24 @@ You are a research assistant tasked with synthesizing information from a diverse
 *   Markdown files (content provided directly)
 *   Web links (HTML content, which will be provided to you as pre-processed text)
 *   Other text-based sources (e.g., social media posts, documents – content provided directly)
+
+
 """
 
         user_query = "Generate a comprehensive research report in Markdown format based on the provided knowledge base."
         result = self.client.models.generate_content(
             model="gemini-2.0-pro-exp-02-05",
-            contents=[myfile, system_prompt, user_query],
+            contents=[myfile, user_query, system_prompt],
+            config={
+            'response_mime_type': 'application/json',
+            'response_schema': MarkdownResponse
+            }
         )
 
         # save response .text
 
         with open("response.md", "w") as f:
-            f.write(result.text)
+            f.write(json.loads(result.text)['markdown'])
 
         return result.text
 
